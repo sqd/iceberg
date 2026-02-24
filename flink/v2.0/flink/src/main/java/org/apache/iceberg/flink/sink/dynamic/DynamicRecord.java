@@ -34,13 +34,31 @@ public class DynamicRecord {
   private Schema schema;
   private RowData rowData;
   private PartitionSpec partitionSpec;
-  private DistributionMode distributionMode;
+  @Nullable private DistributionMode distributionMode;
   private int writeParallelism;
   private boolean upsertMode;
   @Nullable private Set<String> equalityFields;
 
   /**
-   * Constructs a new DynamicRecord.
+   * Constructs a new DynamicRecord with forward (no shuffle) writes.
+   *
+   * @param tableIdentifier The target table identifier.
+   * @param branch The target table branch.
+   * @param schema The target table schema.
+   * @param rowData The data matching the provided schema.
+   * @param partitionSpec The target table {@link PartitionSpec}.
+   */
+  public DynamicRecord(
+      TableIdentifier tableIdentifier,
+      String branch,
+      Schema schema,
+      RowData rowData,
+      PartitionSpec partitionSpec)
+    this(tableIdentifier, branch, schema, rowData, partitionSpec, null, -1);
+  }
+
+  /**
+   * Constructs a new DynamicRecord. This record will be shuffled as specified by {@code distributionMode}.
    *
    * @param tableIdentifier The target table identifier.
    * @param branch The target table branch.

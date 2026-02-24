@@ -476,17 +476,17 @@ builder.append();
 The user should provide a converter which converts the input record to a DynamicRecord.
 We need the following information (DynamicRecord) for every record:
 
-| Property           | Description                                                                               |
-|--------------------|-------------------------------------------------------------------------------------------|
-| `TableIdentifier`  | The target table to which the record will be written.                                     |
-| `Branch`           | The target branch for writing the record (optional).                                      |
-| `Schema`           | The schema of the record.                                                                 |
-| `Spec`             | The expected partitioning specification for the record.                                   |
-| `RowData`          | The actual row data to be written.                                                        |
-| `DistributionMode` | The distribution mode for writing the record (currently supports NONE or HASH).           |
-| `Parallelism`      | The maximum number of parallel writers for a given table/branch/schema/spec (WriteTarget). |
-| `UpsertMode`       | Overrides this table's write.upsert.enabled (optional).                                   |
-| `EqualityFields`   | The equality fields for the table(optional).                                                        |
+| Property           | Description                                                                                       |
+|--------------------|---------------------------------------------------------------------------------------------------|
+| `TableIdentifier`  | The target table to which the record will be written.                                             |
+| `Branch`           | The target branch for writing the record (optional).                                              |
+| `Schema`           | The schema of the record.                                                                         |
+| `Spec`             | The expected partitioning specification for the record.                                           |
+| `RowData`          | The actual row data to be written.                                                                |
+| `DistributionMode` | The distribution mode for writing the record (NONE, HASH, or nullable — `null` avoids any data shuffle). |
+| `Parallelism`      | The maximum number of parallel writers for a given table/branch/schema/spec (WriteTarget).        |
+| `UpsertMode`       | Overrides this table's write.upsert.enabled (optional).                                           |
+| `EqualityFields`   | The equality fields for the table(optional).                                                      |
 
 ### Schema Evolution
 
@@ -541,11 +541,33 @@ The Dynamic Iceberg Flink Sink is configured using the Builder pattern. Here are
 | `cacheMaxSize(int maxSize)`                          | Set cache size for table metadata                                                                                                                                       |
 | `cacheRefreshMs(long refreshMs)`                     | Set cache refresh interval                                                                                                                                              |
 | `inputSchemasPerTableCacheMaxSize(int size)`         | Set max input schemas to cache per table                                                                                                                                |
-| `immediateTableUpdate(boolean enabled)`              | Controls whether table metadata (schema/partition spec) updates immediately (default: false)                                                                                                                                                                   |
+| `immediateTableUpdate(boolean enabled)`              | Controls whether table metadata (schema/partition spec) updates immediately (default: false). Note: forward-mode records (`null` distributionMode) always update immediately regardless of this setting. |
 | `set(String property, String value)`                 | Set any Iceberg write property (e.g., `"write.format"`, `"write.upsert.enabled"`).Check out all the options here: [write-options](flink-configuration.md#write-options) |
 | `setAll(Map<String, String> properties)`             | Set multiple properties at once                                                                                                                                         |
 | `tableCreator(TableCreator creator)` | When DynamicIcebergSink creates new Iceberg tables, allows overriding how tables are created - setting custom table properties and location based on the table name. |
 | `dropUnusedColumns(boolean enabled)`                 | When enabled, drops all columns from the current table schema which are not contained in the input schema (see the caveats above on dropping columns).                  |
+
+### Distribution Modes
+
+The `DistributionMode` set on each `DynamicRecord` controls how that record is routed from the processor to the writer:
+
+| Mode | Behavior |
+|------|----------|
+| `NONE` | Records are distributed across writer subtasks in a round-robin fashion (or by equality fields if set). |
+| `HASH` | Records are distributed by partition key (partitioned tables) or equality fields (unpartitioned tables). Ensures that records for the same partition are handled by the same writer subtask. |
+| `null` | Forward mode: bypasses distribution entirely and sends records directly via a forward edge (see below). |
+
+#### Forward Mode (null DistributionMode)
+
+Setting `distributionMode` to `null` on a `DynamicRecord` bypasses distribution entirely. Use the shorter constructor that omits the `distributionMode` parameter, which defaults to `null`. This is designed for high-throughput pipelines where every partition already has a large volume of data and the serialization and network shuffle cost is prohibitive. Records are sent directly from the processor to the writer using a forward edge, enabling Flink operator chaining. Table metadata updates are always performed immediately inside the processor (regardless of `immediateTableUpdate` setting), because a dedicated table-update operator was deliberately omitted to avoid introducing extra data shuffles.
+
+Forward and regular records can be mixed in the same pipeline. The processor routes records to two separate sink outputs:
+
+- **Shuffle sink**: receives records with a non-null `distributionMode`. These go through the normal distribution topology (hash/round-robin) before reaching the writer.
+- **Forward sink**: receives records with `null` `distributionMode`. These skip distribution entirely and flow via a forward edge from the processor, allowing Flink operator chaining. Suited for high-throughput tables where avoiding shuffle overhead is critical.
+
+!!! warning
+    In the forward path, schema changes are always applied immediately because records must pass straight through via the forward edge. For the intended high-volume use case, this can cause many conflicting commits to the Iceberg catalog and temporarily delay data processing. Consider either updating the schema externally before publishing records with the new schema, or planning for a temporary disruption in throughput when a new schema is introduced from upstream.
 
 ### Notes
 
