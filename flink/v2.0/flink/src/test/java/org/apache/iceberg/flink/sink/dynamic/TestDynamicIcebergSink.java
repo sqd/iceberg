@@ -31,7 +31,6 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
-import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.function.Function;
 import java.util.stream.Collectors;
 import java.util.stream.StreamSupport;
@@ -40,9 +39,6 @@ import org.apache.flink.api.common.typeinfo.TypeHint;
 import org.apache.flink.api.common.typeinfo.TypeInformation;
 import org.apache.flink.api.connector.sink2.Committer;
 import org.apache.flink.api.connector.sink2.CommitterInitContext;
-import org.apache.flink.api.connector.sink2.CommittingSinkWriter;
-import org.apache.flink.api.connector.sink2.SinkWriter;
-import org.apache.flink.api.connector.sink2.WriterInitContext;
 import org.apache.flink.api.java.tuple.Tuple2;
 import org.apache.flink.configuration.Configuration;
 import org.apache.flink.configuration.RestartStrategyOptions;
@@ -51,7 +47,9 @@ import org.apache.flink.runtime.OperatorIDPair;
 import org.apache.flink.runtime.client.JobExecutionException;
 import org.apache.flink.runtime.jobgraph.JobVertex;
 import org.apache.flink.streaming.api.datastream.DataStream;
+import org.apache.flink.streaming.api.datastream.DataStreamSource;
 import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
+import org.apache.flink.streaming.api.graph.StreamNode;
 import org.apache.flink.table.catalog.ResolvedSchema;
 import org.apache.flink.table.data.RowData;
 import org.apache.flink.table.data.util.DataFormatConverters;
@@ -122,7 +120,6 @@ class TestDynamicIcebergSink extends TestFlinkIcebergSinkBase {
     String branch;
     PartitionSpec partitionSpec;
     boolean upsertMode;
-    @Nullable DistributionMode distributionMode;
     Set<String> equalityFields;
 
     private DynamicIcebergDataImpl(
@@ -190,15 +187,8 @@ class TestDynamicIcebergSink extends TestFlinkIcebergSinkBase {
       this.tableName = tableName;
       this.branch = branch;
       this.partitionSpec = partitionSpec;
-      this.distributionMode =
-          partitionSpec.isPartitioned() ? DistributionMode.HASH : DistributionMode.NONE;
       this.upsertMode = upsertMode;
       this.equalityFields = equalityFields;
-    }
-
-    DynamicIcebergDataImpl withNoShuffle() {
-      this.distributionMode = null;
-      return this;
     }
   }
 
@@ -217,7 +207,58 @@ class TestDynamicIcebergSink extends TestFlinkIcebergSinkBase {
               schema,
               converter(schema).toInternal(row.rowProvided),
               spec,
-              row.distributionMode,
+              spec.isPartitioned() ? DistributionMode.HASH : DistributionMode.NONE,
+              10);
+      dynamicRecord.setUpsertMode(row.upsertMode);
+      dynamicRecord.setEqualityFields(row.equalityFields);
+      out.collect(dynamicRecord);
+    }
+  }
+
+  /** Generator that always emits forward (null distributionMode) records. */
+  private static class ForwardGenerator implements DynamicRecordGenerator<DynamicIcebergDataImpl> {
+    @Override
+    public void generate(DynamicIcebergDataImpl row, Collector<DynamicRecord> out) {
+      TableIdentifier tableIdentifier = TableIdentifier.of(DATABASE, row.tableName);
+      Schema schema = row.schemaProvided;
+      PartitionSpec spec = row.partitionSpec;
+      DynamicRecord dynamicRecord =
+          new DynamicRecord(
+              tableIdentifier,
+              row.branch,
+              schema,
+              converter(schema).toInternal(row.rowProvided),
+              spec,
+              10);
+      dynamicRecord.setUpsertMode(row.upsertMode);
+      dynamicRecord.setEqualityFields(row.equalityFields);
+      out.collect(dynamicRecord);
+    }
+  }
+
+  /**
+   * Generator that alternates between forward (null distributionMode) and shuffle records. Even
+   * indices go forward, odd indices go through shuffle.
+   */
+  private static class MixedGenerator implements DynamicRecordGenerator<DynamicIcebergDataImpl> {
+    private int count = 0;
+
+    @Override
+    public void generate(DynamicIcebergDataImpl row, Collector<DynamicRecord> out) {
+      TableIdentifier tableIdentifier = TableIdentifier.of(DATABASE, row.tableName);
+      Schema schema = row.schemaProvided;
+      PartitionSpec spec = row.partitionSpec;
+      boolean forward = (count++ % 2 == 0);
+      DistributionMode mode =
+          forward ? null : (spec.isPartitioned() ? DistributionMode.HASH : DistributionMode.NONE);
+      DynamicRecord dynamicRecord =
+          new DynamicRecord(
+              tableIdentifier,
+              row.branch,
+              schema,
+              converter(schema).toInternal(row.rowProvided),
+              spec,
+              mode,
               10);
       dynamicRecord.setUpsertMode(row.upsertMode);
       dynamicRecord.setEqualityFields(row.equalityFields);
@@ -256,7 +297,7 @@ class TestDynamicIcebergSink extends TestFlinkIcebergSinkBase {
         env.fromData(
             Collections.emptyList(), TypeInformation.of(new TypeHint<DynamicIcebergDataImpl>() {}));
     DynamicIcebergSink.forInput(dataStream)
-        .generator(new Generator())
+        .generator(new ForwardGenerator())
         .catalogLoader(CATALOG_EXTENSION.catalogLoader())
         .writeParallelism(2)
         .immediateTableUpdate(false)
@@ -272,14 +313,12 @@ class TestDynamicIcebergSink extends TestFlinkIcebergSinkBase {
         if (uid == null) {
           continue;
         }
-
-        if (uid.endsWith("-forward-sink")) {
+        if (uid.endsWith("-writer-forward")) {
           sinkInThisVertex = true;
         } else if (uid.endsWith("-generator")) {
           generatorInThisVertex = true;
         }
       }
-
       generatorAndSinkChained = generatorInThisVertex && sinkInThisVertex;
       if (generatorAndSinkChained) {
         break;
@@ -290,25 +329,8 @@ class TestDynamicIcebergSink extends TestFlinkIcebergSinkBase {
   }
 
   @Test
-  void testWriteNoShuffle() throws Exception {
-    ShuffleOrForwardTrackingBuilder.reset();
-
-    List<DynamicIcebergDataImpl> forwardRows =
-        Lists.newArrayList(
-            new DynamicIcebergDataImpl(
-                    SimpleDataUtil.SCHEMA,
-                    "t1",
-                    SnapshotRef.MAIN_BRANCH,
-                    PartitionSpec.unpartitioned())
-                .withNoShuffle(),
-            new DynamicIcebergDataImpl(
-                    SimpleDataUtil.SCHEMA,
-                    "t1",
-                    SnapshotRef.MAIN_BRANCH,
-                    PartitionSpec.unpartitioned())
-                .withNoShuffle());
-
-    List<DynamicIcebergDataImpl> shuffleRows =
+  void testForwardWrite() throws Exception {
+    List<DynamicIcebergDataImpl> rows =
         Lists.newArrayList(
             new DynamicIcebergDataImpl(
                 SimpleDataUtil.SCHEMA,
@@ -321,17 +343,12 @@ class TestDynamicIcebergSink extends TestFlinkIcebergSinkBase {
                 SnapshotRef.MAIN_BRANCH,
                 PartitionSpec.unpartitioned()));
 
-    List<DynamicIcebergDataImpl> allRows = Lists.newArrayList();
-    allRows.addAll(forwardRows);
-    allRows.addAll(shuffleRows);
-
     DataStream<DynamicIcebergDataImpl> dataStream =
-        env.fromData(allRows, TypeInformation.of(new TypeHint<>() {}));
+        env.fromData(rows, TypeInformation.of(new TypeHint<>() {}));
     env.setParallelism(1);
 
-    new ShuffleOrForwardTrackingBuilder<DynamicIcebergDataImpl>()
-        .forInput(dataStream)
-        .generator(new Generator())
+    DynamicIcebergSink.forInput(dataStream)
+        .generator(new ForwardGenerator())
         .catalogLoader(CATALOG_EXTENSION.catalogLoader())
         .writeParallelism(1)
         .immediateTableUpdate(true)
@@ -339,20 +356,48 @@ class TestDynamicIcebergSink extends TestFlinkIcebergSinkBase {
 
     env.execute("Test Forward Write");
 
-    assertThat(ShuffleOrForwardTrackingBuilder.forwardRecords).hasSize(forwardRows.size());
-    assertThat(ShuffleOrForwardTrackingBuilder.shuffleRecords).hasSize(shuffleRows.size());
+    verifyResults(rows);
+  }
 
-    Set<Integer> forwardIds =
-        ShuffleOrForwardTrackingBuilder.forwardRecords.stream()
-            .map(r -> r.rowData().getInt(0))
-            .collect(Collectors.toSet());
-    Set<Integer> shuffleIds =
-        ShuffleOrForwardTrackingBuilder.shuffleRecords.stream()
-            .map(r -> r.rowData().getInt(0))
-            .collect(Collectors.toSet());
-    assertThat(forwardIds).doesNotContainAnyElementsOf(shuffleIds);
+  @Test
+  void testMixedForwardAndShuffleWrite() throws Exception {
+    List<DynamicIcebergDataImpl> rows =
+        Lists.newArrayList(
+            new DynamicIcebergDataImpl(
+                SimpleDataUtil.SCHEMA,
+                "t1",
+                SnapshotRef.MAIN_BRANCH,
+                PartitionSpec.unpartitioned()),
+            new DynamicIcebergDataImpl(
+                SimpleDataUtil.SCHEMA,
+                "t1",
+                SnapshotRef.MAIN_BRANCH,
+                PartitionSpec.unpartitioned()),
+            new DynamicIcebergDataImpl(
+                SimpleDataUtil.SCHEMA,
+                "t1",
+                SnapshotRef.MAIN_BRANCH,
+                PartitionSpec.unpartitioned()),
+            new DynamicIcebergDataImpl(
+                SimpleDataUtil.SCHEMA,
+                "t1",
+                SnapshotRef.MAIN_BRANCH,
+                PartitionSpec.unpartitioned()));
 
-    verifyResults(allRows);
+    DataStream<DynamicIcebergDataImpl> dataStream =
+        env.fromData(rows, TypeInformation.of(new TypeHint<>() {}));
+    env.setParallelism(1);
+
+    DynamicIcebergSink.forInput(dataStream)
+        .generator(new MixedGenerator())
+        .catalogLoader(CATALOG_EXTENSION.catalogLoader())
+        .writeParallelism(1)
+        .immediateTableUpdate(true)
+        .append();
+
+    env.execute("Test Mixed Forward and Shuffle Write");
+
+    verifyResults(rows);
   }
 
   @Test
@@ -1273,6 +1318,67 @@ class TestDynamicIcebergSink extends TestFlinkIcebergSinkBase {
     assertThat(resultSchema.findField("DATA")).isNotNull();
   }
 
+  @Test
+  void testOperatorUidsAreDeterministic() {
+    assertThat(createSinkAndReturnUIds("test")).isEqualTo(createSinkAndReturnUIds("test"));
+    assertThat(createSinkAndReturnUIds("test"))
+        .doesNotContainAnyElementsOf(createSinkAndReturnUIds("test2"));
+  }
+
+  @Test
+  void testOperatorUidsFormat() {
+    Set<String> sinkUids = createSinkAndReturnUIds("test");
+    // These look odd, but we need to keep the UIDs consistent. We had a bug where the UID of the
+    // pre commit topology was off, but since it is stateless, users will still be able to restore
+    // state, but we must keep the stateful operators UUIds like the committer consistent.
+    assertThat(sinkUids)
+        .contains(
+            "test--sink",
+            "test--generator",
+            "test--updater",
+            "test--sink: test--pre-commit-topology",
+            "Sink Committer: test--sink");
+
+    sinkUids = createSinkAndReturnUIds("");
+    assertThat(sinkUids)
+        .contains(
+            "--sink",
+            "--generator",
+            "--updater",
+            "--sink: --pre-commit-topology",
+            "Sink Committer: --sink");
+
+    sinkUids = createSinkAndReturnUIds(null);
+    assertThat(sinkUids)
+        .contains(
+            "--sink",
+            "--generator",
+            "--updater",
+            "--sink: --pre-commit-topology",
+            "Sink Committer: --sink");
+  }
+
+  private Set<String> createSinkAndReturnUIds(String uidPrefix) {
+    StreamExecutionEnvironment streamEnv = StreamExecutionEnvironment.getExecutionEnvironment();
+
+    DataStreamSource<DynamicIcebergDataImpl> source =
+        streamEnv.fromData(Collections.emptySet(), TypeInformation.of(new TypeHint<>() {}));
+    source.uid("source");
+
+    DynamicIcebergSink.forInput(source)
+        .generator(new Generator())
+        .catalogLoader(CATALOG_EXTENSION.catalogLoader())
+        .uidPrefix(uidPrefix)
+        .append();
+
+    // Make sure to get the expanded graph with all sink nodes
+    return streamEnv.getStreamGraph().getStreamNodes().stream()
+        .map(StreamNode::getTransformationUID)
+        // We are not interested in the source
+        .filter(uid -> !uid.equals("source"))
+        .collect(Collectors.toSet());
+  }
+
   /**
    * Represents a concurrent duplicate commit during an ongoing commit operation, which can happen
    * in production scenarios when using REST catalog.
@@ -1415,7 +1521,7 @@ class TestDynamicIcebergSink extends TestFlinkIcebergSinkBase {
 
     @Override
     DynamicIcebergSink instantiateSink(
-        Map<String, String> writeProperties, Configuration flinkConfig, boolean forwardOnly) {
+        Map<String, String> writeProperties, Configuration flinkConfig) {
       return new CommitHookDynamicIcebergSink(
           commitHook,
           CATALOG_EXTENSION.catalogLoader(),
@@ -1423,8 +1529,7 @@ class TestDynamicIcebergSink extends TestFlinkIcebergSinkBase {
           "uidPrefix",
           writeProperties,
           flinkConfig,
-          100,
-          forwardOnly);
+          100);
     }
   }
 
@@ -1440,16 +1545,14 @@ class TestDynamicIcebergSink extends TestFlinkIcebergSinkBase {
         String uidPrefix,
         Map<String, String> writeProperties,
         Configuration flinkConfig,
-        int cacheMaximumSize,
-        boolean forwardOnly) {
+        int cacheMaximumSize) {
       super(
           catalogLoader,
           snapshotProperties,
           uidPrefix,
           writeProperties,
           flinkConfig,
-          cacheMaximumSize,
-          forwardOnly);
+          cacheMaximumSize);
       this.commitHook = commitHook;
       this.overwriteMode = new FlinkWriteConf(writeProperties, flinkConfig).overwriteMode();
     }
@@ -1464,101 +1567,6 @@ class TestDynamicIcebergSink extends TestFlinkIcebergSinkBase {
           10,
           "sinkId",
           new DynamicCommitterMetrics(context.metricGroup()));
-    }
-  }
-
-  static class ShuffleOrForwardTrackingBuilder<T> extends DynamicIcebergSink.Builder<T> {
-    static List<DynamicRecordInternal> forwardRecords = new CopyOnWriteArrayList<>();
-    static List<DynamicRecordInternal> shuffleRecords = new CopyOnWriteArrayList<>();
-
-    static void reset() {
-      forwardRecords.clear();
-      shuffleRecords.clear();
-    }
-
-    @Override
-    DynamicIcebergSink instantiateSink(
-        Map<String, String> writeProperties, Configuration flinkConfig, boolean forwardOnly) {
-      return new TrackingSink(
-          CATALOG_EXTENSION.catalogLoader(),
-          Collections.emptyMap(),
-          "uidPrefix",
-          writeProperties,
-          flinkConfig,
-          100,
-          forwardOnly);
-    }
-
-    private static class TrackingSink extends DynamicIcebergSink {
-      private final boolean forwardOnly;
-
-      TrackingSink(
-          CatalogLoader catalogLoader,
-          Map<String, String> snapshotProperties,
-          String uidPrefix,
-          Map<String, String> writeProperties,
-          Configuration flinkConfig,
-          int cacheMaximumSize,
-          boolean forwardOnly) {
-        super(
-            catalogLoader,
-            snapshotProperties,
-            uidPrefix,
-            writeProperties,
-            flinkConfig,
-            cacheMaximumSize,
-            forwardOnly);
-        this.forwardOnly = forwardOnly;
-      }
-
-      @Override
-      public SinkWriter<DynamicRecordInternal> createWriter(WriterInitContext context) {
-        return new TrackingWriter(
-            (CommittingSinkWriter<DynamicRecordInternal, DynamicWriteResult>)
-                super.createWriter(context),
-            forwardOnly);
-      }
-    }
-
-    private static class TrackingWriter
-        implements CommittingSinkWriter<DynamicRecordInternal, DynamicWriteResult> {
-      private final CommittingSinkWriter<DynamicRecordInternal, DynamicWriteResult> delegate;
-      private final boolean forwardOnly;
-
-      TrackingWriter(
-          CommittingSinkWriter<DynamicRecordInternal, DynamicWriteResult> delegate,
-          boolean forwardOnly) {
-        this.delegate = delegate;
-        this.forwardOnly = forwardOnly;
-      }
-
-      @Override
-      public void write(DynamicRecordInternal element, Context context)
-          throws IOException, InterruptedException {
-        if (forwardOnly) {
-          forwardRecords.add(element);
-        } else {
-          shuffleRecords.add(element);
-        }
-
-        delegate.write(element, context);
-      }
-
-      @Override
-      public void flush(boolean endOfInput) throws IOException, InterruptedException {
-        delegate.flush(endOfInput);
-      }
-
-      @Override
-      public Collection<DynamicWriteResult> prepareCommit()
-          throws IOException, InterruptedException {
-        return delegate.prepareCommit();
-      }
-
-      @Override
-      public void close() throws Exception {
-        delegate.close();
-      }
     }
   }
 
