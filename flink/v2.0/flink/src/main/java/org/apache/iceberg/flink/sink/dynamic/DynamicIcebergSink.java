@@ -132,7 +132,7 @@ public class DynamicIcebergSink
     return new DynamicCommittableSerializer();
   }
 
-  void setForwardWriteResults(
+  private void setForwardWriteResults(
       DataStream<CommittableMessage<DynamicWriteResult>> forwardResults) {
     this.forwardWriteResults = forwardResults;
   }
@@ -172,7 +172,7 @@ public class DynamicIcebergSink
             prefixIfNotNull(uidPrefix, sinkId + " Pre Commit"),
             typeInformation,
             new DynamicWriteResultAggregator(catalogLoader, cacheMaximumSize))
-        .uid(prefixIfNotNull(uidPrefix, "-pre-commit-topology"));
+        .uid(prefixIfNotNull(uidPrefix, sinkId + "-pre-commit-topology"));
   }
 
   @Override
@@ -186,7 +186,7 @@ public class DynamicIcebergSink
    * downstream. The committer is never called — committing is handled by the main sink.
    */
   @VisibleForTesting
-  static class WriterSink
+  static class ForwardWriterSink
       implements Sink<DynamicRecordInternal>, SupportsCommitter<DynamicWriteResult> {
 
     private final CatalogLoader catalogLoader;
@@ -194,7 +194,7 @@ public class DynamicIcebergSink
     private final Configuration flinkConfig;
     private final int cacheMaximumSize;
 
-    WriterSink(
+    ForwardWriterSink(
         CatalogLoader catalogLoader,
         Map<String, String> writeProperties,
         Configuration flinkConfig,
@@ -489,8 +489,8 @@ public class DynamicIcebergSink
               .returns(type);
 
       // Forward writer: chained with generator via forward edge, no data shuffle
-      WriterSink writerSink =
-          new WriterSink(
+      ForwardWriterSink forwardWriterSink =
+          new ForwardWriterSink(
               sink.catalogLoader, sink.writeProperties, sink.flinkConfig, sink.cacheMaximumSize);
       TypeInformation<CommittableMessage<DynamicWriteResult>> writeResultTypeInfo =
           CommittableMessageTypeInfo.of(sink::getWriteResultSerializer);
@@ -498,13 +498,12 @@ public class DynamicIcebergSink
       DataStream<CommittableMessage<DynamicWriteResult>> forwardWritten =
           converted
               .getSideOutput(
-                  new OutputTag<>(
-                      DynamicRecordProcessor.DYNAMIC_FORWARD_STREAM, sideOutputType))
+                  new OutputTag<>(DynamicRecordProcessor.DYNAMIC_FORWARD_STREAM, sideOutputType))
               .transform(
-                  operatorName("Writer-Forward"),
+                  operatorName("Forward-Writer"),
                   writeResultTypeInfo,
-                  new SinkWriterOperatorFactory<>(writerSink))
-              .uid(prefixIfNotNull(uidPrefix, "-writer-forward"));
+                  new SinkWriterOperatorFactory<>(forwardWriterSink))
+              .uid(prefixIfNotNull(uidPrefix, "-forward-writer"));
 
       // Inject forward write results into sink — they'll be unioned in addPreCommitTopology
       sink.setForwardWriteResults(forwardWritten);
@@ -531,7 +530,9 @@ public class DynamicIcebergSink
               .union(converted);
 
       DataStreamSink<DynamicRecordInternal> result =
-          shuffleInput.sinkTo(sink).uid(prefixIfNotNull(uidPrefix, "-sink"));
+          shuffleInput
+              .sinkTo(sink) // Forward write results are implicitly injected here
+              .uid(prefixIfNotNull(uidPrefix, "-sink"));
 
       FlinkWriteConf flinkWriteConf = new FlinkWriteConf(writeOptions, readableConfig);
       if (flinkWriteConf.writeParallelism() != null) {
